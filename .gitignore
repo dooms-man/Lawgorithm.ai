@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+*.log
+*.sqlite3
+venv/
+.env/
+.idea/
+*.pdf
+config.json
