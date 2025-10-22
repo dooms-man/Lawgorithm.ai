@@ -74,9 +74,9 @@ Documents (Regulations / Contracts)
 | Layer              | Technology                               | Purpose                                |
 | ------------------ | ---------------------------------------- | -------------------------------------- |
 | Backend            | FastAPI, Python                          | Core API and orchestration             |
-| NLP/ML             | Sentence Transformers, OpenAI API, spaCy | Embedding & semantic analysis          |
+| NLP/ML             | Sentence Transformers, zephyr, spaCy     | Embedding & semantic analysis          |
 | Database           | PostgreSQL                               | Compliance flags, audit logs, feedback |
-| Explainability     | SHAP, LLM-based explanations             | Model transparency                     |
+| Explainability     | LLM-based explanations                   | Model transparency                     |
 | Deployment         | Docker, Uvicorn                          | Containerized service                  |
 | Frontend (Planned) | Vue.js / React (JSX)                     | Department dashboards                  |
 
@@ -86,4 +86,5 @@ Team: Runtime Raita
 -Akshara Gupta
 -Manas Shewale
 -Hardik Bhalekar
+
 
