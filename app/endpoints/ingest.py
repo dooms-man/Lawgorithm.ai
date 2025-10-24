@@ -1,113 +1,81 @@
-from fastapi import APIRouter, UploadFile, File, Form
-from app.utils.text_cleaning import extract_text_chunks
-from app.utils.dead import extract_entities_and_deadlines
-from app.models.embeddings import model
-from app.db.queries import (
-    insert_chunk,
-    insert_regulation_chunk,
-    insert_contract_deadline,
-    insert_contract_chunk,
-    get_contract_id_from_db
-)
-from app.endpoints.gap_detection import detect_gaps_for_regulation
-from app.config import CHUNK_SIZE, CHUNK_OVERLAP
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from pathlib import Path
+import shutil
+import uuid
+import logging
+import os
+
+# Import OCR + summarizer from repo root ocr package
+# (ensure ocr/ is on PYTHONPATH or project root is package root)
+from ocr.process_doc import process_pdf
+from ocr.summarizer import run as summarizer_run
 
 router = APIRouter()
-
-@router.get("/")
-def root():
-    return {
-        "message": "🚀 Legal RAG API - Regulation & Compliance Ingest Endpoint",
-        "info": "Upload PDFs, extract chunks, store embeddings, extract deadlines/consequences, and find compliance gaps."
-    }
-
+logger = logging.getLogger("ingest")
+logger.setLevel(logging.INFO)
 
 @router.post("/ingest")
-async def ingest_file(
+async def ingest_pdf(
     file: UploadFile = File(...),
-    doc_type: str = Form(...),  # "regulation" | "internal_compliance" | "contract"
-    jurisdiction: str = Form(None)
+    max_pages: int = Form(3),
+    dpi: int = Form(300),
+    outdir: str = Form("outputs")
 ):
-    if not file.filename.endswith(".pdf"):
-        return {"error": "Only PDF files are supported."}
+    """
+    Upload a PDF, run OCR (process_pdf) then summarizer.run on the produced OCR JSON.
+    Returns combined OCR JSON and summarization result.
+    """
+    uploads_dir = Path("uploads")
+    outputs_dir = Path(outdir)
 
-    if doc_type not in ["regulation", "internal_compliance", "contract"]:
-        return {"error": "Invalid document type."}
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    pdf_path = f"./{file.filename}"
-    with open(pdf_path, "wb") as f:
-        f.write(await file.read())
+    # Save uploaded file
+    unique_prefix = uuid.uuid4().hex
+    saved_name = f"{unique_prefix}_{file.filename}"
+    saved_path = uploads_dir / saved_name
 
-    chunks = extract_text_chunks(pdf_path, CHUNK_SIZE, CHUNK_OVERLAP)
-    processed_count = 0
-    all_deadlines, all_consequences = [], []
+    try:
+        with saved_path.open("wb") as dst:
+            shutil.copyfileobj(file.file, dst)
 
-    # Initialize contract_id (used in metadata)
-    contract_id = None
-    if doc_type == "contract":
-        contract_id = get_contract_id_from_db(file.filename)
+        logger.info(f"Saved upload to {saved_path}")
 
-    for idx, chunk in enumerate(chunks):
-        text = chunk["text"]
-        embedding = model.encode(text).tolist()
+        # Run OCR -> returns JSON-like dict and writes outputs/<stem>.json
+        ocr_result = process_pdf(str(saved_path), outdir=str(outputs_dir), max_pages=max_pages, dpi=dpi)
 
-        info = extract_entities_and_deadlines(text)
-        deadlines = info.get("deadlines", [])
-        consequences = info.get("consequences", [])
-        entities = info.get("entities", [])
-        references = info.get("references", [])
+        # The process_pdf writes outputs/<stem>.json. Build path and call summarizer.
+        ocr_json_path = outputs_dir / f"{Path(saved_path).stem}.json"
+        if not ocr_json_path.exists():
+            # If process_pdf returned dict but did not write file, try to use the dict to save then summarize
+            try:
+                import json
+                with open(ocr_json_path, "w", encoding="utf-8") as f:
+                    json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"Could not write ocr json to {ocr_json_path}: {e}")
 
-        metadata = {
-            "file_name": file.filename,
-            "page": chunk["page"],
-            "chunk_index": idx,
-            "doc_type": doc_type,
-            "jurisdiction": jurisdiction,
-            "deadlines": deadlines,
-            "consequences": consequences,
-            "entities": entities,
-            "references": references,
-            "contractid": contract_id
+        # Summarize
+        summary_result = summarizer_run(str(ocr_json_path), outdir=str(outputs_dir))
+
+        # Build a compact response (the full OCR JSON can be large)
+        response = {
+            "status": "success",
+            "uploaded_filename": file.filename,
+            "saved_path": str(saved_path),
+            "ocr_json_path": str(ocr_json_path),
+            "ocr": ocr_result,
+            "summary": summary_result
         }
+        return JSONResponse(status_code=200, content=response)
 
-        # Insert into main table
-        insert_chunk(text, embedding, metadata)
-        processed_count += 1
-        all_deadlines.extend(deadlines)
-        all_consequences.extend(consequences)
-
-        # Handle contract-specific inserts
-        if doc_type == "contract" and deadlines:
-            for d in deadlines:
-                insert_contract_chunk(text, embedding, metadata)
-                insert_contract_deadline(
-                    contract_id=contract_id,
-                    chunk_index=idx,
-                    date=d.get("date"),
-                    description=d.get("sentence"),
-                    consequence=None
-                )
-
-        # Handle regulation-specific inserts
-        if doc_type == "regulation":
-            if not jurisdiction:
-                return {"error": "Jurisdiction is required for regulation documents."}
-            insert_regulation_chunk(text, embedding, metadata)
-
-    # Gap detection for regulation
-    flags_generated = 0
-    if doc_type == "regulation":
-        suggestions = detect_gaps_for_regulation(chunks)
-        flags_generated = len(suggestions)
-
-    return {
-        "status": "success",
-        "file_name": file.filename,
-        "doc_type": doc_type,
-        "chunks_processed": processed_count,
-        "deadlines_extracted": all_deadlines,
-        "consequences_extracted": all_consequences,
-        "compliance_flags_generated": flags_generated,
-        "jurisdiction": jurisdiction,
-        "contractid": contract_id
-    }
+    except Exception as e:
+        logger.exception("Ingest processing failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
